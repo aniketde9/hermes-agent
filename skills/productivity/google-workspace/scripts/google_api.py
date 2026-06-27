@@ -54,6 +54,13 @@ SCOPES = [
 ]
 
 
+def _emit_json(data, **kwargs) -> None:
+    """Write JSON to stdout as UTF-8 (Windows cp1252 consoles cannot print emoji)."""
+    out = json.dumps(data, **kwargs)
+    sys.stdout.buffer.write(out.encode("utf-8", errors="replace"))
+    sys.stdout.buffer.write(b"\n")
+
+
 def _normalize_authorized_user_payload(payload: dict) -> dict:
     normalized = dict(payload)
     if not normalized.get("type"):
@@ -242,7 +249,7 @@ def gmail_search(args):
                     "labels": msg.get("labelIds", []),
                 }
             )
-        print(json.dumps(output, indent=2, ensure_ascii=False))
+        _emit_json(output, indent=2, ensure_ascii=False)
         return
 
     service = build_service("gmail", "v1")
@@ -271,7 +278,7 @@ def gmail_search(args):
             "snippet": msg.get("snippet", ""),
             "labels": msg.get("labelIds", []),
         })
-    print(json.dumps(output, indent=2, ensure_ascii=False))
+    _emit_json(output, indent=2, ensure_ascii=False)
 
 
 
@@ -292,7 +299,7 @@ def gmail_get(args):
             "labels": msg.get("labelIds", []),
             "body": _extract_message_body(msg),
         }
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        _emit_json(result, indent=2, ensure_ascii=False)
         return
 
     service = build_service("gmail", "v1")
@@ -311,7 +318,7 @@ def gmail_get(args):
         "labels": msg.get("labelIds", []),
         "body": _extract_message_body(msg),
     }
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    _emit_json(result, indent=2, ensure_ascii=False)
 
 
 
@@ -335,7 +342,7 @@ def gmail_send(args):
             params={"userId": "me"},
             body=body,
         )
-        print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
+        _emit_json({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2)
         return
 
     service = build_service("gmail", "v1")
@@ -354,7 +361,7 @@ def gmail_send(args):
         body["threadId"] = args.thread_id
 
     result = service.users().messages().send(userId="me", body=body).execute()
-    print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
+    _emit_json({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2)
 
 
 
@@ -390,7 +397,7 @@ def gmail_reply(args):
             params={"userId": "me"},
             body={"raw": raw, "threadId": original["threadId"]},
         )
-        print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
+        _emit_json({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2)
         return
 
     service = build_service("gmail", "v1")
@@ -417,7 +424,7 @@ def gmail_reply(args):
     body = {"raw": raw, "threadId": original["threadId"]}
 
     result = service.users().messages().send(userId="me", body=body).execute()
-    print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
+    _emit_json({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2)
 
 
 
@@ -425,13 +432,13 @@ def gmail_labels(args):
     if _gws_binary():
         results = _run_gws(["gmail", "users", "labels", "list"], params={"userId": "me"})
         labels = [{"id": l["id"], "name": l["name"], "type": l.get("type", "")} for l in results.get("labels", [])]
-        print(json.dumps(labels, indent=2))
+        _emit_json(labels, indent=2)
         return
 
     service = build_service("gmail", "v1")
     results = service.users().labels().list(userId="me").execute()
     labels = [{"id": l["id"], "name": l["name"], "type": l.get("type", "")} for l in results.get("labels", [])]
-    print(json.dumps(labels, indent=2))
+    _emit_json(labels, indent=2)
 
 
 
@@ -448,12 +455,12 @@ def gmail_modify(args):
             params={"userId": "me", "id": args.message_id},
             body=body,
         )
-        print(json.dumps({"id": result["id"], "labels": result.get("labelIds", [])}, indent=2))
+        _emit_json({"id": result["id"], "labels": result.get("labelIds", [])}, indent=2)
         return
 
     service = build_service("gmail", "v1")
     result = service.users().messages().modify(userId="me", id=args.message_id, body=body).execute()
-    print(json.dumps({"id": result["id"], "labels": result.get("labelIds", [])}, indent=2))
+    _emit_json({"id": result["id"], "labels": result.get("labelIds", [])}, indent=2)
 
 
 # =========================================================================
@@ -490,7 +497,7 @@ def calendar_list(args):
                 "status": e.get("status", ""),
                 "htmlLink": e.get("htmlLink", ""),
             })
-        print(json.dumps(events, indent=2, ensure_ascii=False))
+        _emit_json(events, indent=2, ensure_ascii=False)
         return
 
     service = build_service("calendar", "v3")
@@ -511,7 +518,7 @@ def calendar_list(args):
             "status": e.get("status", ""),
             "htmlLink": e.get("htmlLink", ""),
         })
-    print(json.dumps(events, indent=2, ensure_ascii=False))
+    _emit_json(events, indent=2, ensure_ascii=False)
 
 
 
@@ -534,34 +541,34 @@ def calendar_create(args):
             params={"calendarId": args.calendar},
             body=event,
         )
-        print(json.dumps({
+        _emit_json({
             "status": "created",
             "id": result["id"],
             "summary": result.get("summary", ""),
             "htmlLink": result.get("htmlLink", ""),
-        }, indent=2))
+        }, indent=2)
         return
 
     service = build_service("calendar", "v3")
     result = service.events().insert(calendarId=args.calendar, body=event).execute()
-    print(json.dumps({
+    _emit_json({
         "status": "created",
         "id": result["id"],
         "summary": result.get("summary", ""),
         "htmlLink": result.get("htmlLink", ""),
-    }, indent=2))
+    }, indent=2)
 
 
 
 def calendar_delete(args):
     if _gws_binary():
         _run_gws(["calendar", "events", "delete"], params={"calendarId": args.calendar, "eventId": args.event_id})
-        print(json.dumps({"status": "deleted", "eventId": args.event_id}))
+        _emit_json({"status": "deleted", "eventId": args.event_id})
         return
 
     service = build_service("calendar", "v3")
     service.events().delete(calendarId=args.calendar, eventId=args.event_id).execute()
-    print(json.dumps({"status": "deleted", "eventId": args.event_id}))
+    _emit_json({"status": "deleted", "eventId": args.event_id})
 
 
 # =========================================================================
@@ -580,7 +587,7 @@ def drive_search(args):
                 "fields": "files(id, name, mimeType, modifiedTime, webViewLink)",
             },
         )
-        print(json.dumps(results.get("files", []), indent=2, ensure_ascii=False))
+        _emit_json(results.get("files", []), indent=2, ensure_ascii=False)
         return
 
     service = build_service("drive", "v3")
@@ -588,7 +595,7 @@ def drive_search(args):
         q=query, pageSize=args.max, fields="files(id, name, mimeType, modifiedTime, webViewLink)",
     ).execute()
     files = results.get("files", [])
-    print(json.dumps(files, indent=2, ensure_ascii=False))
+    _emit_json(files, indent=2, ensure_ascii=False)
 
 
 def drive_get(args):
@@ -599,12 +606,12 @@ def drive_get(args):
             ["drive", "files", "get"],
             params={"fileId": args.file_id, "fields": fields},
         )
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        _emit_json(result, indent=2, ensure_ascii=False)
         return
 
     service = build_service("drive", "v3")
     result = service.files().get(fileId=args.file_id, fields=fields).execute()
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    _emit_json(result, indent=2, ensure_ascii=False)
 
 
 def drive_upload(args):
@@ -630,13 +637,13 @@ def drive_upload(args):
         media_body=media,
         fields="id, name, mimeType, webViewLink",
     ).execute()
-    print(json.dumps({
+    _emit_json({
         "status": "uploaded",
         "id": result["id"],
         "name": result.get("name", ""),
         "mimeType": result.get("mimeType", ""),
         "webViewLink": result.get("webViewLink", ""),
-    }, indent=2, ensure_ascii=False))
+    }, indent=2, ensure_ascii=False)
 
 
 def drive_download(args):
@@ -679,13 +686,13 @@ def drive_download(args):
         _, done = downloader.next_chunk()
     fh.close()
 
-    print(json.dumps({
+    _emit_json({
         "status": "downloaded",
         "id": args.file_id,
         "name": name,
         "path": str(out_path),
         "mimeType": mime,
-    }, indent=2, ensure_ascii=False))
+    }, indent=2, ensure_ascii=False)
 
 
 def drive_create_folder(args):
@@ -702,22 +709,22 @@ def drive_create_folder(args):
             params={"fields": "id, name, webViewLink"},
             body=body,
         )
-        print(json.dumps({
+        _emit_json({
             "status": "created",
             "id": result["id"],
             "name": result.get("name", ""),
             "webViewLink": result.get("webViewLink", ""),
-        }, indent=2, ensure_ascii=False))
+        }, indent=2, ensure_ascii=False)
         return
 
     service = build_service("drive", "v3")
     result = service.files().create(body=body, fields="id, name, webViewLink").execute()
-    print(json.dumps({
+    _emit_json({
         "status": "created",
         "id": result["id"],
         "name": result.get("name", ""),
         "webViewLink": result.get("webViewLink", ""),
-    }, indent=2, ensure_ascii=False))
+    }, indent=2, ensure_ascii=False)
 
 
 def drive_share(args):
@@ -745,13 +752,13 @@ def drive_share(args):
             },
             body=permission,
         )
-        print(json.dumps({
+        _emit_json({
             "status": "shared",
             "permissionId": result.get("id", ""),
             "fileId": args.file_id,
             "role": permission["role"],
             "type": permission["type"],
-        }, indent=2, ensure_ascii=False))
+        }, indent=2, ensure_ascii=False)
         return
 
     service = build_service("drive", "v3")
@@ -761,13 +768,13 @@ def drive_share(args):
         sendNotificationEmail=args.notify,
         fields="id",
     ).execute()
-    print(json.dumps({
+    _emit_json({
         "status": "shared",
         "permissionId": result.get("id", ""),
         "fileId": args.file_id,
         "role": permission["role"],
         "type": permission["type"],
-    }, indent=2, ensure_ascii=False))
+    }, indent=2, ensure_ascii=False)
 
 
 def drive_delete(args):
@@ -775,11 +782,11 @@ def drive_delete(args):
     if args.permanent:
         if _gws_binary():
             _run_gws(["drive", "files", "delete"], params={"fileId": args.file_id})
-            print(json.dumps({"status": "deleted", "fileId": args.file_id, "permanent": True}))
+            _emit_json({"status": "deleted", "fileId": args.file_id, "permanent": True})
             return
         service = build_service("drive", "v3")
         service.files().delete(fileId=args.file_id).execute()
-        print(json.dumps({"status": "deleted", "fileId": args.file_id, "permanent": True}))
+        _emit_json({"status": "deleted", "fileId": args.file_id, "permanent": True})
         return
 
     # Trash (reversible). Use files.update with trashed=True.
@@ -790,12 +797,12 @@ def drive_delete(args):
             params={"fileId": args.file_id},
             body=body,
         )
-        print(json.dumps({"status": "trashed", "fileId": args.file_id, "permanent": False}))
+        _emit_json({"status": "trashed", "fileId": args.file_id, "permanent": False})
         return
 
     service = build_service("drive", "v3")
     service.files().update(fileId=args.file_id, body=body).execute()
-    print(json.dumps({"status": "trashed", "fileId": args.file_id, "permanent": False}))
+    _emit_json({"status": "trashed", "fileId": args.file_id, "permanent": False})
 
 
 # =========================================================================
@@ -823,7 +830,7 @@ def contacts_list(args):
                 "emails": [e.get("value", "") for e in emails],
                 "phones": [p.get("value", "") for p in phones],
             })
-        print(json.dumps(contacts, indent=2, ensure_ascii=False))
+        _emit_json(contacts, indent=2, ensure_ascii=False)
         return
 
     service = build_service("people", "v1")
@@ -842,7 +849,7 @@ def contacts_list(args):
             "emails": [e.get("value", "") for e in emails],
             "phones": [p.get("value", "") for p in phones],
         })
-    print(json.dumps(contacts, indent=2, ensure_ascii=False))
+    _emit_json(contacts, indent=2, ensure_ascii=False)
 
 
 # =========================================================================
@@ -856,14 +863,14 @@ def sheets_get(args):
             ["sheets", "spreadsheets", "values", "get"],
             params={"spreadsheetId": args.sheet_id, "range": args.range},
         )
-        print(json.dumps(result.get("values", []), indent=2, ensure_ascii=False))
+        _emit_json(result.get("values", []), indent=2, ensure_ascii=False)
         return
 
     service = build_service("sheets", "v4")
     result = service.spreadsheets().values().get(
         spreadsheetId=args.sheet_id, range=args.range,
     ).execute()
-    print(json.dumps(result.get("values", []), indent=2, ensure_ascii=False))
+    _emit_json(result.get("values", []), indent=2, ensure_ascii=False)
 
 
 
@@ -881,7 +888,7 @@ def sheets_update(args):
             },
             body=body,
         )
-        print(json.dumps({"updatedCells": result.get("updatedCells", 0), "updatedRange": result.get("updatedRange", "")}, indent=2))
+        _emit_json({"updatedCells": result.get("updatedCells", 0), "updatedRange": result.get("updatedRange", "")}, indent=2)
         return
 
     service = build_service("sheets", "v4")
@@ -889,7 +896,7 @@ def sheets_update(args):
         spreadsheetId=args.sheet_id, range=args.range,
         valueInputOption="USER_ENTERED", body=body,
     ).execute()
-    print(json.dumps({"updatedCells": result.get("updatedCells", 0), "updatedRange": result.get("updatedRange", "")}, indent=2))
+    _emit_json({"updatedCells": result.get("updatedCells", 0), "updatedRange": result.get("updatedRange", "")}, indent=2)
 
 
 
@@ -908,7 +915,7 @@ def sheets_append(args):
             },
             body=body,
         )
-        print(json.dumps({"updatedCells": result.get("updates", {}).get("updatedCells", 0)}, indent=2))
+        _emit_json({"updatedCells": result.get("updates", {}).get("updatedCells", 0)}, indent=2)
         return
 
     service = build_service("sheets", "v4")
@@ -916,7 +923,7 @@ def sheets_append(args):
         spreadsheetId=args.sheet_id, range=args.range,
         valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS", body=body,
     ).execute()
-    print(json.dumps({"updatedCells": result.get("updates", {}).get("updatedCells", 0)}, indent=2))
+    _emit_json({"updatedCells": result.get("updates", {}).get("updatedCells", 0)}, indent=2)
 
 
 def sheets_create(args):
@@ -927,24 +934,24 @@ def sheets_create(args):
 
     if _gws_binary():
         result = _run_gws(["sheets", "spreadsheets", "create"], body=body)
-        print(json.dumps({
+        _emit_json({
             "status": "created",
             "spreadsheetId": result.get("spreadsheetId", ""),
             "title": result.get("properties", {}).get("title", ""),
             "spreadsheetUrl": result.get("spreadsheetUrl", ""),
-        }, indent=2, ensure_ascii=False))
+        }, indent=2, ensure_ascii=False)
         return
 
     service = build_service("sheets", "v4")
     result = service.spreadsheets().create(
         body=body, fields="spreadsheetId,properties,spreadsheetUrl",
     ).execute()
-    print(json.dumps({
+    _emit_json({
         "status": "created",
         "spreadsheetId": result.get("spreadsheetId", ""),
         "title": result.get("properties", {}).get("title", ""),
         "spreadsheetUrl": result.get("spreadsheetUrl", ""),
-    }, indent=2, ensure_ascii=False))
+    }, indent=2, ensure_ascii=False)
 
 
 # =========================================================================
@@ -960,7 +967,7 @@ def docs_get(args):
             "documentId": doc.get("documentId", ""),
             "body": _extract_doc_text(doc),
         }
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        _emit_json(result, indent=2, ensure_ascii=False)
         return
 
     service = build_service("docs", "v1")
@@ -970,7 +977,7 @@ def docs_get(args):
         "documentId": doc.get("documentId", ""),
         "body": _extract_doc_text(doc),
     }
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    _emit_json(result, indent=2, ensure_ascii=False)
 
 
 def docs_create(args):
@@ -988,12 +995,12 @@ def docs_create(args):
     if args.body and doc_id:
         _docs_insert_text(doc_id, args.body, index=1)
 
-    print(json.dumps({
+    _emit_json({
         "status": "created",
         "documentId": doc_id,
         "title": doc.get("title", ""),
         "url": f"https://docs.google.com/document/d/{doc_id}/edit" if doc_id else "",
-    }, indent=2, ensure_ascii=False))
+    }, indent=2, ensure_ascii=False)
 
 
 def docs_append(args):
@@ -1018,12 +1025,12 @@ def docs_append(args):
     text = args.text if args.text.endswith("\n") else args.text + "\n"
     _docs_insert_text(args.doc_id, text, index=insert_index)
 
-    print(json.dumps({
+    _emit_json({
         "status": "appended",
         "documentId": args.doc_id,
         "inserted_at": insert_index,
         "characters": len(text),
-    }, indent=2, ensure_ascii=False))
+    }, indent=2, ensure_ascii=False)
 
 
 def _docs_insert_text(doc_id: str, text: str, index: int) -> None:
