@@ -2228,8 +2228,8 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_not_called()
 
-    def test_silent_trailing_suppresses_delivery(self):
-        """Agent appended [SILENT] after explanation text — must still suppress."""
+    def test_silent_trailing_still_delivers_content(self):
+        """Trailing [SILENT] after real content is stripped; body is delivered."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
@@ -2238,7 +2238,8 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
+        assert deliver_mock.call_args[0][1] == "2 deals filtered out (like<10, reply<15)."
 
     def test_silent_is_case_insensitive(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \

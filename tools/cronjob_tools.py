@@ -437,6 +437,58 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     return None
 
 
+def _gather_cron_status() -> Dict[str, Any]:
+    """Return structured cron scheduler health for the cronjob tool."""
+    from cron.jobs import (
+        TICKER_INTERVAL_SECONDS,
+        get_ticker_heartbeat_age,
+        get_ticker_success_age,
+        list_jobs,
+    )
+    from hermes_cli.gateway import find_gateway_pids
+
+    pids = find_gateway_pids()
+    stale_after = TICKER_INTERVAL_SECONDS * 3 + 20
+    hb_age = get_ticker_heartbeat_age()
+    ok_age = get_ticker_success_age()
+
+    gateway_running = bool(pids)
+    ticker_status = "unknown"
+    message = ""
+
+    if not gateway_running:
+        ticker_status = "down"
+        message = "Gateway is not running — cron jobs will NOT fire."
+    elif hb_age is not None and hb_age > stale_after:
+        ticker_status = "stalled"
+        message = (
+            f"Gateway is running but cron ticker looks stalled "
+            f"(no heartbeat for {int(hb_age)}s)."
+        )
+    elif hb_age is not None and ok_age is not None and ok_age > stale_after:
+        ticker_status = "failing"
+        message = (
+            f"Gateway and ticker are running but no tick succeeded in {int(ok_age)}s."
+        )
+    else:
+        ticker_status = "ok"
+        message = "Gateway is running — cron jobs will fire automatically."
+
+    active_jobs = list_jobs(include_disabled=False)
+    next_runs = [j.get("next_run_at") for j in active_jobs if j.get("next_run_at")]
+
+    return {
+        "gateway_running": gateway_running,
+        "gateway_pids": pids,
+        "ticker_status": ticker_status,
+        "ticker_heartbeat_age_seconds": int(hb_age) if hb_age is not None else None,
+        "ticker_success_age_seconds": int(ok_age) if ok_age is not None else None,
+        "active_job_count": len(active_jobs),
+        "next_run_at": min(next_runs) if next_runs else None,
+        "message": message,
+    }
+
+
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
@@ -453,7 +505,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "base_url": job.get("base_url"),
         "schedule": job.get("schedule_display") or "?",
         "repeat": _repeat_display(job),
-        "deliver": job.get("deliver", "local"),
+        "deliver": job.get("deliver") or ("origin" if job.get("origin") else "local"),
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
@@ -627,6 +679,10 @@ def cronjob(
         if normalized == "list":
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
+
+        if normalized == "status":
+            status = _gather_cron_status()
+            return json.dumps({"success": True, **status}, indent=2)
 
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
@@ -803,6 +859,7 @@ CRONJOB_SCHEMA = {
 
 Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
+Use action='status' to check gateway/ticker health and next scheduled run.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
@@ -821,7 +878,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, status, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
             },
             "job_id": {
                 "type": "string",

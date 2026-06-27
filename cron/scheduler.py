@@ -243,6 +243,39 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+
+def _resolve_cron_delivery_content(final_response: str) -> tuple[bool, str]:
+    """Decide whether to deliver a cron final response and what text to send.
+
+    Pure ``[SILENT]`` responses (optionally with a short note) suppress delivery.
+    When an agent incorrectly appends ``[SILENT]`` after real content, strip the
+    marker and deliver the substantive body.
+    """
+    text = (final_response or "").strip()
+    if not text:
+        return False, text
+
+    upper = text.upper()
+    if upper == SILENT_MARKER:
+        return False, text
+
+    if upper.startswith(SILENT_MARKER):
+        remainder = text[len(SILENT_MARKER):].strip()
+        if not remainder or len(remainder) < 120:
+            return False, text
+
+    marker_upper = SILENT_MARKER.upper()
+    idx = upper.rfind(marker_upper)
+    if idx >= 0:
+        before = text[:idx].rstrip()
+        after = text[idx + len(SILENT_MARKER):].strip()
+        if before and not after:
+            text = before
+
+    if not text.strip():
+        return False, text
+    return True, text
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
@@ -2328,10 +2361,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # Treat whitespace-only final responses the same as empty
         # responses: do not deliver a blank message, and let the
         # empty-response guard below mark the run as a soft failure.
-        should_deliver = bool(deliver_content.strip())
-        if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-            logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-            should_deliver = False
+        should_deliver, deliver_content = _resolve_cron_delivery_content(deliver_content)
+        if not should_deliver and success and (final_response or "").strip():
+            logger.info(
+                "Job '%s': agent returned %s — skipping delivery",
+                job["id"],
+                SILENT_MARKER,
+            )
 
         delivery_error = None
         if should_deliver:
