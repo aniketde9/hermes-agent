@@ -3076,6 +3076,84 @@ def _collect_query_images(query: str | None, image_arg: str | None = None) -> tu
     return message, deduped
 
 
+_WORK_KANBAN_TASK_QUERY_RE = re.compile(
+    r"^work\s+kanban\s+task\s+(\S+)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _prepare_kanban_worker_single_query(
+    query: str | None,
+    images: list[Path] | None = None,
+) -> tuple[str, list[Path], list[str]]:
+    """Prepare a dispatcher-spawned kanban worker's first user turn in-process.
+
+    Workers arrive as ``hermes -p <profile> chat -q "work kanban task <id>"``
+    with ``HERMES_KANBAN_TASK`` already set. They must execute the task inside
+    this process — re-launching Hermes would recurse until the host exhausts
+    PIDs. This helper loads the task from ``kanban_db``, injects the same
+    worker context block ``kanban_show`` would return, and attaches any image
+    refs found in the task body.
+
+    Returns ``(effective_query, images, image_urls)``.
+    """
+    message = query or ""
+    out_images: list[Path] = list(images or [])
+    image_urls: list[str] = []
+
+    env_task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    query_task_id = None
+    if isinstance(message, str):
+        match = _WORK_KANBAN_TASK_QUERY_RE.match(message.strip())
+        if match:
+            query_task_id = match.group(1).strip()
+
+    task_id = env_task_id or query_task_id
+    if not task_id:
+        return message, out_images, image_urls
+
+    try:
+        from hermes_cli import kanban_db as _kb
+        from agent.image_routing import extract_image_refs as _extract_refs
+
+        worker_context = ""
+        task_body = ""
+        _conn = _kb.connect()
+        try:
+            _task = _kb.get_task(_conn, task_id)
+            if _task is None:
+                return message, out_images, image_urls
+            worker_context = _kb.build_worker_context(_conn, task_id)
+            task_body = getattr(_task, "body", "") or ""
+        finally:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+
+        header = f"work kanban task {task_id}"
+        if worker_context:
+            message = f"{header}\n\n{worker_context}"
+        elif isinstance(message, str) and message.strip().lower() != header.lower():
+            message = header
+
+        if task_body:
+            _kb_paths, _kb_urls = _extract_refs(task_body)
+            if _kb_paths:
+                _seen = {str(p) for p in out_images}
+                for _p in _kb_paths:
+                    if _p not in _seen:
+                        _seen.add(_p)
+                        out_images.append(Path(_p))
+            if _kb_urls:
+                image_urls.extend(_kb_urls)
+    except Exception as exc:
+        # Best-effort enrichment; never block worker startup on it.
+        logger.debug("kanban worker query preparation failed: %s", exc)
+
+    return message, out_images, image_urls
+
+
 # Strip OSC escape sequences (e.g. OSC-8 hyperlinks) that prompt_toolkit's
 # ANSI parser can't handle — it strips \x1b but passes the payload through
 # as literal text, garbling the TUI output.
@@ -14961,43 +15039,12 @@ def main(
             sys.exit(1)
         try:
             query, single_query_images = _collect_query_images(query, image)
-            # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
-            # the actual task description lives in the task body. Mirror the
-            # gateway/CLI behaviour for inbound images by scanning the body for
-            # local image paths and http(s) image URLs and attaching them to the
-            # worker's first turn. Without this, users who paste a screenshot
-            # path or URL into a kanban task body never get it routed to the
-            # model's vision input.
-            single_query_image_urls: list[str] = []
-            _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
-            if _kanban_task_id:
-                try:
-                    from hermes_cli import kanban_db as _kb
-                    from agent.image_routing import extract_image_refs as _extract_refs
-
-                    _conn = _kb.connect()
-                    try:
-                        _task = _kb.get_task(_conn, _kanban_task_id)
-                    finally:
-                        try:
-                            _conn.close()
-                        except Exception:
-                            pass
-                    _body = getattr(_task, "body", "") if _task is not None else ""
-                    if _body:
-                        _kb_paths, _kb_urls = _extract_refs(_body)
-                        if _kb_paths:
-                            # Dedupe against any --image the user already passed.
-                            _seen = {str(p) for p in single_query_images}
-                            for _p in _kb_paths:
-                                if _p not in _seen:
-                                    _seen.add(_p)
-                                    single_query_images.append(Path(_p))
-                        if _kb_urls:
-                            single_query_image_urls.extend(_kb_urls)
-                except Exception as _exc:
-                    # Best-effort enrichment; never block worker startup on it.
-                    logger.debug("kanban image-ref extraction failed: %s", _exc)
+            # Kanban workers arrive as ``hermes chat -q "work kanban task <id>"``
+            # with ``HERMES_KANBAN_TASK`` set by the dispatcher. Execute the task
+            # in-process (load DB context + image refs) — never re-spawn Hermes.
+            query, single_query_images, single_query_image_urls = (
+                _prepare_kanban_worker_single_query(query, single_query_images)
+            )
             if quiet:
                 # Quiet mode: suppress banner, spinner, tool previews.
                 # Only print the final response and parseable session info.
