@@ -36,6 +36,15 @@ from hermes_constants import (
 logger = logging.getLogger(__name__)
 
 
+def _windows_subprocess_kwargs() -> dict:
+    """Suppress brief console flashes when spawning bridge/npm on Windows."""
+    if not _IS_WINDOWS:
+        return {}
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    return {"creationflags": windows_hide_flags()}
+
+
 def _listener_pids_on_port(port: int) -> list:
     """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
 
@@ -82,6 +91,7 @@ def _kill_port_process(port: int) -> None:
             result = subprocess.run(
                 ["netstat", "-ano", "-p", "TCP"],
                 capture_output=True, text=True, timeout=5,
+                **_windows_subprocess_kwargs(),
             )
             for line in result.stdout.splitlines():
                 parts = line.split()
@@ -92,6 +102,7 @@ def _kill_port_process(port: int) -> None:
                             subprocess.run(
                                 ["taskkill", "/PID", parts[4], "/F"],
                                 capture_output=True, timeout=5,
+                                **_windows_subprocess_kwargs(),
                             )
                         except subprocess.SubprocessError:
                             pass
@@ -216,6 +227,7 @@ def _terminate_bridge_process(proc, *, force: bool = False) -> None:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                **_windows_subprocess_kwargs(),
             )
         except FileNotFoundError:
             if force:
@@ -300,7 +312,8 @@ def check_whatsapp_requirements() -> bool:
             [_node, "--version"],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=5,
+            **_windows_subprocess_kwargs(),
         )
         return result.returncode == 0
     except Exception:
@@ -410,7 +423,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return float(default)
         return parsed
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """
         Start the WhatsApp bridge.
         
@@ -443,9 +456,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # clear "run hermes whatsapp" message instead of the watcher
         # silently hammering an unconfigured platform.
         creds_path = self._session_path / "creds.json"
-        if not creds_path.exists():
+        creds_missing = (
+            not creds_path.exists()
+            or creds_path.stat().st_size == 0
+        )
+        if creds_missing:
             logger.warning(
-                "[%s] WhatsApp is enabled but not paired (no creds.json at %s). "
+                "[%s] WhatsApp is enabled but not paired (missing or empty creds.json at %s). "
                 "Run `hermes whatsapp` to pair, or remove WHATSAPP_ENABLED from "
                 "your .env to disable.",
                 self.name, creds_path,
@@ -499,6 +516,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         text=True,
                         timeout=npm_install_timeout,
                         env=with_hermes_node_path(),
+                        **_windows_subprocess_kwargs(),
                     )
                     if install_result.returncode != 0:
                         print(f"[{self.name}] npm install failed: {install_result.stderr}")
@@ -600,6 +618,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 stderr=bridge_log_fh,
                 preexec_fn=None if _IS_WINDOWS else os.setsid,
                 env=bridge_env,
+                **_windows_subprocess_kwargs(),
             )
             _write_bridge_pidfile(self._session_path, self._bridge_process.pid)
             

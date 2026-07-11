@@ -10,8 +10,10 @@ Usage:
   python google_api.py gmail get MESSAGE_ID
   python google_api.py gmail send --to user@example.com --subject "Hi" --body "Hello"
   python google_api.py gmail reply MESSAGE_ID --body "Thanks"
-  python google_api.py calendar list [--from DATE] [--to DATE] [--calendar primary]
-  python google_api.py calendar create --summary "Meeting" --start DATETIME --end DATETIME
+  python google_api.py calendar list [--start DATE] [--end DATE] [--days N] [--calendar primary]
+  python google_api.py calendar get EVENT_ID
+  python google_api.py calendar create --summary "Meeting" --start DATETIME --end DATETIME [--cc emails]
+  python google_api.py calendar delete EVENT_ID [--scope instance|series]
   python google_api.py drive search "budget report" [--max 10]
   python google_api.py contacts list [--max 20]
   python google_api.py sheets get SHEET_ID RANGE
@@ -24,12 +26,14 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # Ensure sibling modules (_hermes_home) are importable when run standalone.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
@@ -135,6 +139,38 @@ def _run_gws(parts: list[str], *, params: dict | None = None, body: dict | None 
         sys.exit(1)
 
 
+def _try_run_gws(parts: list[str], *, params: dict | None = None) -> dict | None:
+    """Like _run_gws but returns None instead of exiting on failure."""
+    binary = _gws_binary()
+    if not binary:
+        return None
+    try:
+        _ensure_authenticated()
+    except SystemExit:
+        return None
+
+    cmd = [binary, *parts]
+    if params is not None:
+        cmd.extend(["--params", json.dumps(params)])
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=_gws_env(),
+    )
+    if result.returncode != 0:
+        return None
+
+    stdout = result.stdout.strip()
+    if not stdout:
+        return {}
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+
 def _headers_dict(msg: dict) -> dict[str, str]:
     return {
         h["name"].lower(): h["value"]
@@ -172,17 +208,179 @@ def _extract_doc_text(doc: dict) -> str:
     return "".join(text_parts)
 
 
-def _datetime_with_timezone(value: str) -> str:
+_RFC3339_OFFSET_RE = re.compile(r"[+-]\d{2}:\d{2}$")
+
+
+def _resolve_user_timezone_name() -> str:
+    """Read configured IANA timezone (HERMES_TIMEZONE env, then config.yaml)."""
+    tz_env = os.getenv("HERMES_TIMEZONE", "").strip()
+    if tz_env:
+        return tz_env
+    config_path = get_hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        if config_path.exists():
+            cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            tz_cfg = cfg.get("timezone", "")
+            if isinstance(tz_cfg, str) and tz_cfg.strip():
+                return tz_cfg.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _user_zoneinfo() -> ZoneInfo | None:
+    tz_name = _resolve_user_timezone_name()
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return None
+
+
+def _user_now() -> datetime:
+    tz = _user_zoneinfo()
+    if tz is not None:
+        return datetime.now(tz)
+    return datetime.now().astimezone()
+
+
+def _has_explicit_offset(value: str) -> bool:
+    if value.endswith("Z"):
+        return True
+    if "T" not in value:
+        return False
+    return bool(_RFC3339_OFFSET_RE.search(value))
+
+
+def _to_api_rfc3339(value: str) -> str:
+    """Convert a user-facing datetime to RFC3339 for timeMin/timeMax."""
+    value = (value or "").strip()
     if not value:
         return value
     if "T" not in value:
+        tz = _user_zoneinfo()
+        if tz is not None:
+            dt = datetime.fromisoformat(value).replace(tzinfo=tz)
+            return dt.isoformat()
+        return f"{value}T00:00:00"
+    if _has_explicit_offset(value):
         return value
-    if value.endswith("Z"):
-        return value
-    tail = value[10:]
-    if "+" in tail or "-" in tail:
-        return value
-    return value + "Z"
+    tz = _user_zoneinfo() or timezone.utc
+    aware = datetime.fromisoformat(value).replace(tzinfo=tz)
+    return aware.isoformat()
+
+
+def _event_datetime_field(value: str) -> dict:
+    """Build a Google Calendar start/end object respecting user timezone."""
+    value = (value or "").strip()
+    if not value:
+        raise ValueError("datetime value is required")
+    if "T" not in value:
+        return {"date": value}
+    tz_name = _resolve_user_timezone_name() or "UTC"
+    if _has_explicit_offset(value):
+        return {"dateTime": value.replace("Z", "+00:00") if value.endswith("Z") else value, "timeZone": tz_name}
+    return {"dateTime": value, "timeZone": tz_name}
+
+
+def _split_emails(value: str) -> list[str]:
+    return [e.strip() for e in (value or "").split(",") if e.strip()]
+
+
+def _build_attendees(required: str, optional: str, cc: str) -> list[dict]:
+    attendees: list[dict] = []
+    for email in _split_emails(required):
+        attendees.append({"email": email})
+    for email in _split_emails(optional) + _split_emails(cc):
+        attendees.append({"email": email, "optional": True})
+    return attendees
+
+
+def _format_calendar_event(e: dict) -> dict:
+    recurring_id = e.get("recurringEventId", "")
+    event_id = e.get("id", "")
+    if recurring_id and recurring_id != event_id:
+        event_kind = "instance"
+    elif e.get("recurrence"):
+        event_kind = "series"
+    else:
+        event_kind = "single"
+
+    attendees = []
+    for attendee in e.get("attendees", []):
+        attendees.append({
+            "email": attendee.get("email", ""),
+            "optional": attendee.get("optional", False),
+            "responseStatus": attendee.get("responseStatus", ""),
+        })
+
+    return {
+        "id": event_id,
+        "summary": e.get("summary", "(no title)"),
+        "start": e.get("start", {}).get("dateTime", e.get("start", {}).get("date", "")),
+        "end": e.get("end", {}).get("dateTime", e.get("end", {}).get("date", "")),
+        "startTimeZone": e.get("start", {}).get("timeZone", ""),
+        "endTimeZone": e.get("end", {}).get("timeZone", ""),
+        "location": e.get("location", ""),
+        "description": e.get("description", ""),
+        "status": e.get("status", ""),
+        "htmlLink": e.get("htmlLink", ""),
+        "eventKind": event_kind,
+        "recurringEventId": recurring_id,
+        "recurrence": e.get("recurrence", []),
+        "attendees": attendees,
+    }
+
+
+def _calendar_fetch_event(calendar_id: str, event_id: str) -> dict | None:
+    if _gws_binary():
+        return _try_run_gws(
+            ["calendar", "events", "get"],
+            params={"calendarId": calendar_id, "eventId": event_id},
+        )
+
+    service = build_service("calendar", "v3")
+    try:
+        return service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+    except Exception as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status in (404, 410):
+            return None
+        return None
+
+
+def _calendar_delete_event(calendar_id: str, event_id: str) -> None:
+    if _gws_binary():
+        _run_gws(
+            ["calendar", "events", "delete"],
+            params={"calendarId": calendar_id, "eventId": event_id},
+        )
+        return
+    service = build_service("calendar", "v3")
+    service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+
+
+def _resolve_delete_event_id(event: dict, scope: str) -> tuple[str, str]:
+    """Return (event_id_to_delete, delete_target_description)."""
+    scope = (scope or "instance").lower()
+    event_id = event.get("id", "")
+    recurring_id = event.get("recurringEventId", "")
+    event_kind = _format_calendar_event(event)["eventKind"]
+
+    if scope == "series":
+        if event_kind == "instance" and recurring_id:
+            return recurring_id, "series"
+        if event_kind == "series":
+            return event_id, "series"
+        return event_id, "single"
+
+    if scope == "following" and event_kind == "instance":
+        return event_id, "instance"
+
+    return event_id, "instance" if event_kind == "instance" else "single"
 
 
 def get_credentials():
@@ -469,106 +667,156 @@ def gmail_modify(args):
 
 
 def calendar_list(args):
-    now = datetime.now(timezone.utc)
-    time_min = _datetime_with_timezone(args.start or now.isoformat())
-    time_max = _datetime_with_timezone(args.end or (now + timedelta(days=7)).isoformat())
+    now = _user_now()
+    days = getattr(args, "days", 0) or 0
+    default_end = now + timedelta(days=days if days > 0 else 7)
+    time_min = _to_api_rfc3339(args.start) if args.start else _to_api_rfc3339(now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat())
+    time_max = _to_api_rfc3339(args.end) if args.end else _to_api_rfc3339(default_end.isoformat())
+    single_events = not getattr(args, "series_only", False)
+    list_params = {
+        "calendarId": args.calendar,
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "maxResults": args.max,
+        "singleEvents": single_events,
+    }
+    if single_events:
+        list_params["orderBy"] = "startTime"
 
     if _gws_binary():
-        results = _run_gws(
-            ["calendar", "events", "list"],
-            params={
-                "calendarId": args.calendar,
-                "timeMin": time_min,
-                "timeMax": time_max,
-                "maxResults": args.max,
-                "singleEvents": True,
-                "orderBy": "startTime",
-            },
-        )
-        events = []
-        for e in results.get("items", []):
-            events.append({
-                "id": e["id"],
-                "summary": e.get("summary", "(no title)"),
-                "start": e.get("start", {}).get("dateTime", e.get("start", {}).get("date", "")),
-                "end": e.get("end", {}).get("dateTime", e.get("end", {}).get("date", "")),
-                "location": e.get("location", ""),
-                "description": e.get("description", ""),
-                "status": e.get("status", ""),
-                "htmlLink": e.get("htmlLink", ""),
-            })
-        _emit_json(events, indent=2, ensure_ascii=False)
+        results = _run_gws(["calendar", "events", "list"], params=list_params)
+        events = [_format_calendar_event(e) for e in results.get("items", [])]
+        _emit_json({
+            "timezone": _resolve_user_timezone_name() or "server-local",
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "singleEvents": single_events,
+            "events": events,
+        }, indent=2, ensure_ascii=False)
         return
 
     service = build_service("calendar", "v3")
-    results = service.events().list(
-        calendarId=args.calendar, timeMin=time_min, timeMax=time_max,
-        maxResults=args.max, singleEvents=True, orderBy="startTime",
-    ).execute()
+    results = service.events().list(**list_params).execute()
+    events = [_format_calendar_event(e) for e in results.get("items", [])]
+    _emit_json({
+        "timezone": _resolve_user_timezone_name() or "server-local",
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "singleEvents": single_events,
+        "events": events,
+    }, indent=2, ensure_ascii=False)
 
-    events = []
-    for e in results.get("items", []):
-        events.append({
-            "id": e["id"],
-            "summary": e.get("summary", "(no title)"),
-            "start": e.get("start", {}).get("dateTime", e.get("start", {}).get("date", "")),
-            "end": e.get("end", {}).get("dateTime", e.get("end", {}).get("date", "")),
-            "location": e.get("location", ""),
-            "description": e.get("description", ""),
-            "status": e.get("status", ""),
-            "htmlLink": e.get("htmlLink", ""),
-        })
-    _emit_json(events, indent=2, ensure_ascii=False)
 
+def calendar_get(args):
+    if _gws_binary():
+        result = _run_gws(
+            ["calendar", "events", "get"],
+            params={"calendarId": args.calendar, "eventId": args.event_id},
+        )
+        _emit_json(_format_calendar_event(result), indent=2, ensure_ascii=False)
+        return
+
+    service = build_service("calendar", "v3")
+    result = service.events().get(calendarId=args.calendar, eventId=args.event_id).execute()
+    _emit_json(_format_calendar_event(result), indent=2, ensure_ascii=False)
 
 
 def calendar_create(args):
     event = {
         "summary": args.summary,
-        "start": {"dateTime": args.start},
-        "end": {"dateTime": args.end},
+        "start": _event_datetime_field(args.start),
+        "end": _event_datetime_field(args.end),
     }
     if args.location:
         event["location"] = args.location
     if args.description:
         event["description"] = args.description
-    if args.attendees:
-        event["attendees"] = [{"email": e.strip()} for e in args.attendees.split(",") if e.strip()]
+    attendees = _build_attendees(args.attendees, getattr(args, "optional_attendees", ""), getattr(args, "cc", ""))
+    if attendees:
+        event["attendees"] = attendees
+    if getattr(args, "recurrence", ""):
+        rules = [r.strip() for r in args.recurrence.split(";") if r.strip()]
+        event["recurrence"] = [
+            r if r.upper().startswith("RRULE:") else f"RRULE:{r}" for r in rules
+        ]
+
+    insert_params = {"calendarId": args.calendar}
+    send_updates = getattr(args, "send_updates", "") or "all"
+    if send_updates:
+        insert_params["sendUpdates"] = send_updates
 
     if _gws_binary():
         result = _run_gws(
             ["calendar", "events", "insert"],
-            params={"calendarId": args.calendar},
+            params=insert_params,
             body=event,
         )
+    else:
+        service = build_service("calendar", "v3")
+        result = service.events().insert(body=event, **insert_params).execute()
+
+    event_id = result.get("id", "")
+    verified_event = _calendar_fetch_event(args.calendar, event_id) if event_id else None
+    if not verified_event:
         _emit_json({
-            "status": "created",
-            "id": result["id"],
-            "summary": result.get("summary", ""),
-            "htmlLink": result.get("htmlLink", ""),
+            "status": "failed",
+            "verified": False,
+            "error": "Event creation could not be verified in calendar",
+            "id": event_id,
         }, indent=2)
         return
 
-    service = build_service("calendar", "v3")
-    result = service.events().insert(calendarId=args.calendar, body=event).execute()
+    formatted = _format_calendar_event(verified_event)
     _emit_json({
         "status": "created",
-        "id": result["id"],
-        "summary": result.get("summary", ""),
-        "htmlLink": result.get("htmlLink", ""),
-    }, indent=2)
-
+        "verified": True,
+        "id": formatted["id"],
+        "summary": formatted["summary"],
+        "start": formatted["start"],
+        "end": formatted["end"],
+        "startTimeZone": formatted["startTimeZone"],
+        "eventKind": formatted["eventKind"],
+        "recurrence": formatted["recurrence"],
+        "attendees": formatted["attendees"],
+        "htmlLink": formatted["htmlLink"],
+    }, indent=2, ensure_ascii=False)
 
 
 def calendar_delete(args):
-    if _gws_binary():
-        _run_gws(["calendar", "events", "delete"], params={"calendarId": args.calendar, "eventId": args.event_id})
-        _emit_json({"status": "deleted", "eventId": args.event_id})
+    target_event = _calendar_fetch_event(args.calendar, args.event_id)
+    if not target_event:
+        _emit_json({
+            "status": "failed",
+            "verified": False,
+            "error": "Event not found before delete",
+            "eventId": args.event_id,
+        })
         return
 
-    service = build_service("calendar", "v3")
-    service.events().delete(calendarId=args.calendar, eventId=args.event_id).execute()
-    _emit_json({"status": "deleted", "eventId": args.event_id})
+    delete_id, delete_target = _resolve_delete_event_id(target_event, getattr(args, "scope", "instance"))
+    summary = target_event.get("summary", "")
+    _calendar_delete_event(args.calendar, delete_id)
+
+    remaining = _calendar_fetch_event(args.calendar, delete_id)
+    if remaining and remaining.get("status") != "cancelled":
+        _emit_json({
+            "status": "failed",
+            "verified": False,
+            "error": "Event still present after delete",
+            "eventId": delete_id,
+            "deleteTarget": delete_target,
+            "summary": summary,
+        })
+        return
+
+    _emit_json({
+        "status": "deleted",
+        "verified": True,
+        "eventId": delete_id,
+        "deleteTarget": delete_target,
+        "summary": summary,
+        "eventKind": _format_calendar_event(target_event)["eventKind"],
+    })
 
 
 # =========================================================================
@@ -1107,22 +1355,52 @@ def main():
     p = cal_sub.add_parser("list")
     p.add_argument("--start", default="", help="Start time (ISO 8601)")
     p.add_argument("--end", default="", help="End time (ISO 8601)")
+    p.add_argument("--days", type=int, default=0, help="Days ahead when --end omitted (default 7)")
     p.add_argument("--max", type=int, default=25)
     p.add_argument("--calendar", default="primary")
+    p.add_argument(
+        "--series-only",
+        action="store_true",
+        help="List recurring series masters instead of expanded instances",
+    )
     p.set_defaults(func=calendar_list)
+
+    p = cal_sub.add_parser("get")
+    p.add_argument("event_id")
+    p.add_argument("--calendar", default="primary")
+    p.set_defaults(func=calendar_get)
 
     p = cal_sub.add_parser("create")
     p.add_argument("--summary", required=True)
-    p.add_argument("--start", required=True, help="Start (ISO 8601 with timezone)")
-    p.add_argument("--end", required=True, help="End (ISO 8601 with timezone)")
+    p.add_argument("--start", required=True, help="Start (ISO 8601; bare times use config timezone)")
+    p.add_argument("--end", required=True, help="End (ISO 8601; bare times use config timezone)")
     p.add_argument("--location", default="")
     p.add_argument("--description", default="")
-    p.add_argument("--attendees", default="", help="Comma-separated email addresses")
+    p.add_argument("--attendees", default="", help="Comma-separated required attendee emails")
+    p.add_argument("--optional-attendees", default="", help="Comma-separated optional attendee emails")
+    p.add_argument("--cc", default="", help="Comma-separated CC emails (optional attendees)")
+    p.add_argument(
+        "--recurrence",
+        default="",
+        help="Recurrence RRULE(s), semicolon-separated (e.g. 'FREQ=WEEKLY;BYDAY=MO')",
+    )
+    p.add_argument(
+        "--send-updates",
+        default="all",
+        choices=["all", "externalOnly", "none"],
+        help="Whether to email attendees about the event",
+    )
     p.add_argument("--calendar", default="primary")
     p.set_defaults(func=calendar_create)
 
     p = cal_sub.add_parser("delete")
     p.add_argument("event_id")
+    p.add_argument(
+        "--scope",
+        default="instance",
+        choices=["instance", "series"],
+        help="Delete one occurrence (instance) or the entire recurring series",
+    )
     p.add_argument("--calendar", default="primary")
     p.set_defaults(func=calendar_delete)
 

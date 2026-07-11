@@ -181,17 +181,17 @@ def test_api_calendar_list_uses_events_list(api_module):
 
     def capture_run(cmd, **kwargs):
         captured["cmd"] = cmd
-        return MagicMock(returncode=0, stdout="{}", stderr="")
+        return MagicMock(returncode=0, stdout='{"items": []}', stderr="")
 
     args = api_module.argparse.Namespace(
-        start="", end="", max=25, calendar="primary", func=api_module.calendar_list,
+        start="", end="", days=0, max=25, calendar="primary", series_only=False,
+        func=api_module.calendar_list,
     )
 
     with patch.object(api_module.subprocess, "run", side_effect=capture_run):
         api_module.calendar_list(args)
 
     cmd = captured["cmd"]
-    # _gws_binary() returns "/usr/bin/gws", so cmd[0] is that binary
     assert cmd[0] == "/usr/bin/gws"
     assert "calendar" in cmd
     assert "events" in cmd
@@ -201,6 +201,7 @@ def test_api_calendar_list_uses_events_list(api_module):
     assert "timeMin" in params
     assert "timeMax" in params
     assert params["calendarId"] == "primary"
+    assert params["singleEvents"] is True
 
 
 def test_api_calendar_list_respects_date_range(api_module):
@@ -209,13 +210,15 @@ def test_api_calendar_list_respects_date_range(api_module):
 
     def capture_run(cmd, **kwargs):
         captured["cmd"] = cmd
-        return MagicMock(returncode=0, stdout="{}", stderr="")
+        return MagicMock(returncode=0, stdout='{"items": []}', stderr="")
 
     args = api_module.argparse.Namespace(
         start="2026-04-01T00:00:00Z",
         end="2026-04-07T23:59:59Z",
+        days=0,
         max=25,
         calendar="primary",
+        series_only=False,
         func=api_module.calendar_list,
     )
 
@@ -227,6 +230,142 @@ def test_api_calendar_list_respects_date_range(api_module):
     params = json.loads(cmd[params_idx + 1])
     assert params["timeMin"] == "2026-04-01T00:00:00Z"
     assert params["timeMax"] == "2026-04-07T23:59:59Z"
+
+
+def test_event_datetime_field_uses_config_timezone(api_module, monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir(exist_ok=True)
+    (hermes_home / "config.yaml").write_text("timezone: Asia/Kolkata\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    field = api_module._event_datetime_field("2026-07-07T22:00:00")
+    assert field == {"dateTime": "2026-07-07T22:00:00", "timeZone": "Asia/Kolkata"}
+
+
+def test_to_api_rfc3339_does_not_force_utc_on_bare_times(api_module, monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir(exist_ok=True)
+    (hermes_home / "config.yaml").write_text("timezone: Asia/Kolkata\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    converted = api_module._to_api_rfc3339("2026-07-07T22:00:00")
+    assert converted.endswith("+05:30")
+    assert "Z" not in converted
+
+
+def test_format_calendar_event_kinds(api_module):
+    single = api_module._format_calendar_event({"id": "abc", "summary": "One"})
+    assert single["eventKind"] == "single"
+
+    series = api_module._format_calendar_event({
+        "id": "series1",
+        "summary": "Weekly",
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+    })
+    assert series["eventKind"] == "series"
+
+    instance = api_module._format_calendar_event({
+        "id": "series1_20260406",
+        "recurringEventId": "series1",
+        "summary": "Weekly",
+    })
+    assert instance["eventKind"] == "instance"
+
+
+def test_build_attendees_marks_cc_optional(api_module):
+    attendees = api_module._build_attendees("alice@co.com", "", "info@opika.co")
+    assert attendees == [
+        {"email": "alice@co.com"},
+        {"email": "info@opika.co", "optional": True},
+    ]
+
+
+def test_api_calendar_create_includes_cc_and_verifies(api_module, capsys):
+    calls = []
+
+    def fake_run_gws(parts, *, params=None, body=None):
+        calls.append({"parts": parts, "params": params, "body": body})
+        if parts == ["calendar", "events", "insert"]:
+            return {"id": "evt-1", "summary": "Sync", "htmlLink": "https://cal.example/e1"}
+        if parts == ["calendar", "events", "get"]:
+            return {
+                "id": "evt-1",
+                "summary": "Sync",
+                "start": {"dateTime": "2026-07-07T22:00:00", "timeZone": "Asia/Kolkata"},
+                "end": {"dateTime": "2026-07-07T23:00:00", "timeZone": "Asia/Kolkata"},
+                "attendees": [
+                    {"email": "guest@co.com"},
+                    {"email": "info@opika.co", "optional": True},
+                ],
+                "htmlLink": "https://cal.example/e1",
+            }
+        raise AssertionError(parts)
+
+    api_module._run_gws = fake_run_gws
+    api_module._try_run_gws = lambda parts, *, params=None: fake_run_gws(parts, params=params)
+    args = api_module.argparse.Namespace(
+        summary="Sync",
+        start="2026-07-07T22:00:00",
+        end="2026-07-07T23:00:00",
+        location="",
+        description="",
+        attendees="guest@co.com",
+        optional_attendees="",
+        cc="info@opika.co",
+        recurrence="",
+        send_updates="all",
+        calendar="primary",
+        func=api_module.calendar_create,
+    )
+
+    api_module.calendar_create(args)
+
+    insert_body = calls[0]["body"]
+    assert insert_body["attendees"] == [
+        {"email": "guest@co.com"},
+        {"email": "info@opika.co", "optional": True},
+    ]
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "created"
+    assert result["verified"] is True
+
+
+def test_api_calendar_delete_verifies_removal(api_module, capsys):
+    fetched = {"count": 0}
+
+    def fake_try_run_gws(parts, *, params=None):
+        if parts == ["calendar", "events", "get"]:
+            fetched["count"] += 1
+            if fetched["count"] == 1:
+                return {
+                    "id": "inst1",
+                    "recurringEventId": "series1",
+                    "summary": "EMM Follow-Up",
+                }
+            return None
+        return None
+
+    deleted = []
+
+    def fake_delete(calendar_id, event_id):
+        deleted.append(event_id)
+
+    api_module._try_run_gws = fake_try_run_gws
+    api_module._calendar_delete_event = fake_delete
+    args = api_module.argparse.Namespace(
+        event_id="inst1",
+        scope="instance",
+        calendar="primary",
+        func=api_module.calendar_delete,
+    )
+
+    api_module.calendar_delete(args)
+
+    assert deleted == ["inst1"]
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "deleted"
+    assert result["verified"] is True
+    assert result["deleteTarget"] == "instance"
 
 
 @pytest.mark.parametrize(

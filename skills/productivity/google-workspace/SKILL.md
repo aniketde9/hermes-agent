@@ -200,19 +200,43 @@ $GAPI gmail modify MESSAGE_ID --remove-labels UNREAD
 
 ### Calendar
 
+Bare datetimes like `2026-07-07T22:00:00` (no offset) are interpreted in the user's
+`timezone` from `config.yaml` (or `HERMES_TIMEZONE`). Prefer bare local times when
+the user gives times in their zone (e.g. "10 PM IST" → `22:00:00` with
+`timezone: Asia/Kolkata` in config).
+
 ```bash
-# List events (defaults to next 7 days)
+# List events (defaults to next 7 days in user's timezone)
 $GAPI calendar list
-$GAPI calendar list --start 2026-03-01T00:00:00Z --end 2026-03-07T23:59:59Z
+$GAPI calendar list --days 14
+$GAPI calendar list --start 2026-03-01T00:00:00 --end 2026-03-07T23:59:59
+$GAPI calendar list --series-only   # recurring series masters, not expanded instances
 
-# Create event (ISO 8601 with timezone required)
-$GAPI calendar create --summary "Team Standup" --start 2026-03-01T10:00:00-06:00 --end 2026-03-01T10:30:00-06:00
-$GAPI calendar create --summary "Lunch" --start 2026-03-01T12:00:00Z --end 2026-03-01T13:00:00Z --location "Cafe"
-$GAPI calendar create --summary "Review" --start 2026-03-01T14:00:00Z --end 2026-03-01T15:00:00Z --attendees "alice@co.com,bob@co.com"
+# Get one event (verify after create/delete)
+$GAPI calendar get EVENT_ID
 
-# Delete event
+# Create event — bare times use config timezone; explicit offsets also work
+$GAPI calendar create --summary "Team Standup" --start 2026-03-01T10:00:00 --end 2026-03-01T10:30:00
+$GAPI calendar create --summary "Lunch" --start 2026-03-01T12:00:00 --end 2026-03-01T13:00:00 --location "Cafe"
+$GAPI calendar create --summary "Review" --start 2026-03-01T14:00:00 --end 2026-03-01T15:00:00 \
+  --attendees "alice@co.com,bob@co.com" --cc "info@opika.co"
+$GAPI calendar create --summary "Weekly Sync" --start 2026-03-03T09:00:00 --end 2026-03-03T09:30:00 \
+  --recurrence "FREQ=WEEKLY;BYDAY=MO"
+
+# Delete — use instance id for one occurrence, --scope series for entire recurring series
 $GAPI calendar delete EVENT_ID
+$GAPI calendar delete EVENT_ID --scope series
 ```
+
+#### Calendar agent procedure
+
+When scheduling or changing events in conversation:
+
+1. **Timezone** — Read `timezone` from the user's config (e.g. `Asia/Kolkata`). When the user says "10 PM" without a zone, use that timezone. Pass bare local ISO times to `--start`/`--end`; do not append `Z` unless they mean UTC.
+2. **Context** — Track title, date, time, duration, attendees, and CC across turns. Do not re-ask for details already given in the conversation. Summarize what you have and only ask for missing fields.
+3. **CC / optional guests** — Google Calendar has no email-style CC. Map CC recipients to `--cc` (optional attendees). Required guests use `--attendees`.
+4. **Recurring events** — After `calendar list`, check `eventKind`: `single`, `instance` (one occurrence of a series), or `series` (master). Use the listed `id` for instance deletes; use `--scope series` (or the `recurringEventId`) to remove the whole series.
+5. **Verify mutations** — After create or delete, read the JSON `verified` field. If `verified` is false or `status` is `failed`, tell the user the action did not succeed and re-list or `calendar get` to reconcile. Never claim success without a verified response.
 
 ### Drive
 
@@ -293,8 +317,10 @@ All commands return JSON. Parse with `jq` or read directly. Key fields:
 - **Gmail search**: `[{id, threadId, from, to, subject, date, snippet, labels}]`
 - **Gmail get**: `{id, threadId, from, to, subject, date, labels, body}`
 - **Gmail send/reply**: `{status: "sent", id, threadId}`
-- **Calendar list**: `[{id, summary, start, end, location, description, htmlLink}]`
-- **Calendar create**: `{status: "created", id, summary, htmlLink}`
+- **Calendar list**: `{timezone, timeMin, timeMax, singleEvents, events: [{id, summary, start, end, eventKind, recurringEventId, recurrence, attendees, ...}]}`
+- **Calendar get**: `{id, summary, start, end, eventKind, recurringEventId, recurrence, attendees, ...}`
+- **Calendar create**: `{status: "created", verified: true, id, summary, start, end, attendees, htmlLink}` or `{status: "failed", verified: false, error}`
+- **Calendar delete**: `{status: "deleted", verified: true, eventId, deleteTarget, summary, eventKind}` or `{status: "failed", verified: false, error}`
 - **Drive search**: `[{id, name, mimeType, modifiedTime, webViewLink}]`
 - **Drive get**: `{id, name, mimeType, modifiedTime, size, webViewLink, parents, owners}`
 - **Drive upload**: `{status: "uploaded", id, name, mimeType, webViewLink}`
@@ -313,7 +339,7 @@ All commands return JSON. Parse with `jq` or read directly. Key fields:
 1. **Never send email, create/delete calendar events, delete Drive files, share files, or modify Docs/Sheets without confirming with the user first.** Show what will be done (recipients, file IDs, content, share role) and ask for approval. For `drive delete`, prefer the default trash (reversible) over `--permanent`.
 2. **Check auth before first use** — run `setup.py --check`. If it fails, guide the user through setup.
 3. **Use the Gmail search syntax reference** for complex queries — load it with `skill_view("google-workspace", file_path="references/gmail-search-syntax.md")`.
-4. **Calendar times must include timezone** — always use ISO 8601 with offset (e.g., `2026-03-01T10:00:00-06:00`) or UTC (`Z`).
+4. **Calendar times** — bare local ISO datetimes use `timezone` from config; explicit offsets (`-06:00`, `Z`) are also accepted. CC guests use `--cc` (optional attendees).
 5. **Respect rate limits** — avoid rapid-fire sequential API calls. Batch reads when possible.
 
 ## Troubleshooting
