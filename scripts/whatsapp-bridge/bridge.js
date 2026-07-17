@@ -44,6 +44,13 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+import {
+  createIgnoreLogger,
+  createReconnectController,
+  isOwnSelfChat,
+  isStaleInbound,
+  shouldExitOnDisconnect,
+} from './self_chat_gate.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -115,6 +122,15 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
+// Drop history dumps older than this (ms). 0 disables. Default 5 minutes.
+const MAX_INBOUND_AGE_MS = parseInt(process.env.WHATSAPP_MAX_INBOUND_AGE_MS || String(5 * 60 * 1000), 10);
+const MAX_RECONNECT_ATTEMPTS = parseInt(process.env.WHATSAPP_MAX_RECONNECT_ATTEMPTS || '20', 10);
+
+const logIgnored = createIgnoreLogger({ windowMs: 60_000 });
+const reconnectCtl = createReconnectController({
+  maxAttempts: Number.isFinite(MAX_RECONNECT_ATTEMPTS) ? MAX_RECONNECT_ATTEMPTS : 20,
+});
+let reconnectTimer = null;
 
 // --- Send queue: serialise all sock.sendMessage() calls across concurrent
 //     HTTP handlers so a single Baileys socket never has overlapping sends.
@@ -426,26 +442,45 @@ async function startSocket() {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
 
-      if (reason === DisconnectReason.loggedOut) {
+      if (shouldExitOnDisconnect(reason, DisconnectReason)) {
         emitPairEvent({ event: 'error', error: 'logged_out', reason });
         if (!PAIR_JSON) {
-          console.log('❌ Logged out. Delete session and restart to re-authenticate.');
+          console.log('❌ Logged out / device removed. Re-pair with: hermes whatsapp');
         }
         process.exit(1);
-      } else {
-        // 515 = restart requested (common after pairing). Always reconnect.
-        emitPairEvent({ event: 'disconnected', reason });
-        if (!PAIR_JSON) {
-          if (reason === 515) {
-            console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
-          } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
-          }
-        }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
       }
+
+      // 515 = restart requested (common after pairing). Bounded backoff otherwise.
+      emitPairEvent({ event: 'disconnected', reason });
+      const { giveUp, attempt, delayMs } = reconnectCtl.nextDelay(reason);
+      if (giveUp) {
+        if (!PAIR_JSON) {
+          console.log(
+            `❌ Gave up reconnecting after ${attempt} attempts (last reason: ${reason}). ` +
+              'Restart the gateway or re-pair with: hermes whatsapp',
+          );
+        }
+        process.exit(1);
+      }
+      if (!PAIR_JSON) {
+        if (reason === 515) {
+          console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
+        } else {
+          console.log(
+            `⚠️  Connection closed (reason: ${reason}). ` +
+              `Reconnect ${attempt}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delayMs / 1000)}s...`,
+          );
+        }
+      }
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(startSocket, delayMs);
     } else if (connection === 'open') {
       connectionState = 'connected';
+      reconnectCtl.reset();
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
@@ -594,18 +629,15 @@ async function startSocket() {
           // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
           // AND classic format: 34652029134@s.whatsapp.net
           // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
-          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-          const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
-          const chatNumber = chatId.replace(/@.*/, '');
-          const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
+          const matched = isOwnSelfChat(chatId, sock.user);
           emitDebugEvent({
             stage: 'self_chat_check',
-            matched: !!isSelfChat,
+            matched,
             chatId: redactWhatsAppId(chatId),
             accountId: redactWhatsAppId(sock.user?.id),
             accountLid: redactWhatsAppId(sock.user?.lid),
           });
-          if (!isSelfChat) {
+          if (!matched) {
             emitDebugEvent({
               stage: 'ignored',
               reason: 'self_chat_mismatch',
@@ -618,33 +650,37 @@ async function startSocket() {
       }
 
       // Handle !fromMe messages (from other people) based on mode.
-      // Self-chat mode only responds to the user's own messages to
-      // themselves — stranger DMs / group pings must never reach the
-      // Python gateway, otherwise a pairing-code reply fires in response
-      // to arbitrary incoming messages (#8389).
+      // Self-chat mode only responds in the user's own self-chat thread.
+      // Phone→linked-device sync of notes-to-self often arrives as fromMe=false;
+      // still accept those when the chat JID is our own phone/LID. Stranger DMs
+      // and groups remain rejected (#8389).
       if (!msg.key.fromMe) {
         if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
+          if (!isOwnSelfChat(chatId, sock.user)) {
+            logIgnored({
               reason: 'self_chat_mode_rejects_non_self',
               chatId,
               senderId,
-            }));
-          } catch {}
+            });
+            continue;
+          }
+        } else if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+          logIgnored({
+            reason: 'allowlist_mismatch',
+            chatId,
+            senderId,
+          });
           continue;
         }
-        if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'allowlist_mismatch',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
-        }
+      }
+
+      if (isStaleInbound(msg, MAX_INBOUND_AGE_MS)) {
+        logIgnored({
+          reason: 'stale_inbound',
+          chatId,
+          senderId,
+        });
+        continue;
       }
 
       const messageContent = getMessageContent(msg);
