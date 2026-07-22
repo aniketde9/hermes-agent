@@ -1454,6 +1454,95 @@ def _gateway_list() -> None:
         print(" — ".join(parts))
 
 
+def _config_wants_start_all_profiles() -> bool:
+    """Return True when config asks bare ``gateway start`` to start every profile."""
+    try:
+        from hermes_cli.config import load_config
+
+        gw = load_config().get("gateway") or {}
+        return bool(gw.get("start_all_profiles", False))
+    except Exception:
+        return False
+
+
+def _should_expand_start_all(args) -> bool:
+    """Whether this invocation should start sibling profile gateways too.
+
+    True for ``hermes gateway start --all``, or bare ``gateway start`` when
+    ``gateway.start_all_profiles: true``. Sibling subprocesses set
+    ``_HERMES_GATEWAY_START_ONE=1`` so they only start themselves.
+    """
+    if os.environ.get("_HERMES_GATEWAY_START_ONE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    if getattr(args, "all", False):
+        return True
+    return _config_wants_start_all_profiles()
+
+
+def _start_other_profile_gateways() -> None:
+    """Start gateways for every profile other than the current one.
+
+    Each sibling runs ``hermes -p <name> gateway start`` in a subprocess so
+    HERMES_HOME / service install paths stay profile-correct. Already-running
+    profiles are skipped.
+    """
+    try:
+        from hermes_cli.profiles import list_profiles, get_active_profile_name
+    except Exception as exc:
+        print(f"⚠ Could not enumerate profiles for start-all: {exc}")
+        return
+
+    current = get_active_profile_name()
+    others = [p for p in list_profiles() if p.name != current]
+    if not others:
+        return
+
+    print()
+    print(f"Starting {len(others)} other profile gateway(s)...")
+    child_env = os.environ.copy()
+    child_env["_HERMES_GATEWAY_START_ONE"] = "1"
+    # Let ``-p`` / default resolution set HERMES_HOME cleanly in the child.
+    child_env.pop("HERMES_HOME", None)
+
+    for prof in others:
+        if prof.gateway_running:
+            print(f"  ✓ {prof.name}: already running")
+            continue
+        print(f"  → {prof.name}...")
+        argv = [get_python_path(), "-m", "hermes_cli.main"]
+        if not getattr(prof, "is_default", False) and prof.name != "default":
+            argv.extend(["-p", prof.name])
+        argv.extend(["gateway", "start"])
+        try:
+            run_kwargs: dict = {
+                "env": child_env,
+                "capture_output": True,
+                "text": True,
+                "timeout": 120,
+            }
+            if is_windows():
+                # Avoid a flashing console when spawning siblings.
+                from hermes_cli._subprocess_compat import windows_hide_flags
+
+                run_kwargs["creationflags"] = windows_hide_flags()
+            proc = subprocess.run(argv, **run_kwargs)
+            out = (proc.stdout or "").strip()
+            if out:
+                for line in out.splitlines():
+                    print(f"    {line}")
+            if proc.returncode != 0:
+                err = (proc.stderr or "").strip() or f"exit {proc.returncode}"
+                print(f"  ✗ {prof.name}: {err[:300]}")
+        except subprocess.TimeoutExpired:
+            print(f"  ✗ {prof.name}: timed out starting gateway")
+        except Exception as exc:
+            print(f"  ✗ {prof.name}: {exc}")
+
+
 def kill_gateway_processes(
     force: bool = False, exclude_pids: set | None = None, all_profiles: bool = False
 ) -> int:
@@ -6362,8 +6451,7 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
     ``want up``/``want down`` flips correctly so supervise stays down
     after a stop).
 
-    ``action`` is one of ``stop`` / ``restart`` (``start --all`` isn't
-    a supported CLI surface).
+    ``action`` is one of ``start`` / ``stop`` / ``restart``.
     """
     from hermes_cli.service_manager import (
         detect_service_manager,
@@ -6372,14 +6460,14 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
 
     if detect_service_manager() != "s6":
         return False
-    if action not in ("stop", "restart"):
+    if action not in ("start", "stop", "restart"):
         return False
     mgr = get_service_manager()
     profiles = mgr.list_profile_gateways()
     if not profiles:
         print("✗ No profile gateways registered under s6")
         return True
-    fn = mgr.stop if action == "stop" else mgr.restart
+    fn = {"start": mgr.start, "stop": mgr.stop, "restart": mgr.restart}[action]
     errors: list[tuple[str, Exception]] = []
     for profile in profiles:
         service_name = f"gateway-{profile}"
@@ -6388,7 +6476,7 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
         except Exception as exc:  # noqa: BLE001 — report and continue
             errors.append((profile, exc))
     succeeded = len(profiles) - len(errors)
-    verb = "stopped" if action == "stop" else "restarted"
+    verb = {"start": "started", "stop": "stopped", "restart": "restarted"}[action]
     if succeeded:
         print(f"✓ {verb.capitalize()} {succeeded} profile gateway(s) under s6")
     for profile, exc in errors:
@@ -6703,24 +6791,16 @@ def _gateway_command_inner(args):
 
     elif subcmd == "start":
         system = getattr(args, "system", False)
-        start_all = getattr(args, "all", False)
+        start_all = _should_expand_start_all(args)
 
         # Phase 4: inside a container with s6, dispatch via the service
         # manager instead of falling through to systemd/launchd/windows.
-        # `--all` isn't meaningful here (each profile has its own service
-        # slot — start them individually via `hermes -p <name> gateway
-        # start`), so just bring up the current profile's slot.
+        # ``--all`` (or gateway.start_all_profiles) iterates every registered
+        # profile gateway through s6.
+        if start_all and _dispatch_all_via_service_manager_if_s6("start"):
+            return
         if not start_all and _dispatch_via_service_manager_if_s6("start"):
             return
-
-        if start_all:
-            # Kill all stale gateway processes across all profiles before starting
-            killed = kill_gateway_processes(all_profiles=True)
-            if killed:
-                print(
-                    f"✓ Killed {killed} stale gateway process(es) across all profiles"
-                )
-                _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
 
         if is_termux():
             print(
@@ -6771,6 +6851,9 @@ def _gateway_command_inner(args):
         else:
             print("Not supported on this platform.")
             sys.exit(1)
+
+        if start_all:
+            _start_other_profile_gateways()
 
     elif subcmd == "stop":
         # Defense: refuse self-targeting gateway stop from inside the gateway.
@@ -6946,6 +7029,7 @@ def _gateway_command_inner(args):
                 gateway_windows.start()
             else:
                 run_gateway(verbose=0)
+            _start_other_profile_gateways()
             return
 
         if supports_systemd_services() and (

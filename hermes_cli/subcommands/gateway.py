@@ -100,7 +100,7 @@ def build_gateway_parser(
     gateway_start.add_argument(
         "--all",
         action="store_true",
-        help="Kill ALL stale gateway processes across all profiles before starting",
+        help="Start gateways for ALL profiles (not just the current one)",
     )
     _add_compat_platform_flag(gateway_start)
 
@@ -129,7 +129,7 @@ def build_gateway_parser(
     gateway_restart.add_argument(
         "--all",
         action="store_true",
-        help="Kill ALL gateway processes across all profiles before restarting",
+        help="Restart ALL profile gateways",
     )
     _add_compat_platform_flag(gateway_restart)
 

@@ -2861,6 +2861,13 @@ DEFAULT_CONFIG = {
         # producing ~/.hermes/sessions/sessions.json entirely.
         "write_sessions_json": True,
 
+        # When true, bare ``hermes gateway start`` also starts every other
+        # profile's gateway (same as ``hermes gateway start --all``). Useful
+        # for multi-bot setups (e.g. default + bot_news + bot_summary).
+        # Default false so single-profile users aren't surprised. Sibling
+        # starts never recurse — they set an internal env guard.
+        "start_all_profiles": False,
+
         # Scale-to-zero idle detection (Phase 0). The gateway watches for idle
         # and, when an instance is opted in via the NAS "Labs" toggle (carried as
         # the HERMES_SCALE_TO_ZERO env stamp) AND messaging is relay-only/absent

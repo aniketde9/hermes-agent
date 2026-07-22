@@ -242,11 +242,47 @@ def test_dispatch_all_empty_list_reports_and_returns_true(
     assert "No profile gateways" in capsys.readouterr().out
 
 
+def test_dispatch_all_start_action_supported(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """`start --all` dispatches through s6 for every registered profile."""
+    from hermes_cli import gateway as gw
+
+    class _Rec:
+        kind = "s6"
+
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def list_profile_gateways(self):
+            return ["default", "bot_news"]
+
+        def start(self, name: str) -> None:
+            self.calls.append(f"start:{name}")
+
+        def stop(self, name: str) -> None:
+            raise AssertionError("stop should not be called")
+
+        def restart(self, name: str) -> None:
+            raise AssertionError("restart should not be called")
+
+    rec = _Rec()
+    monkeypatch.setattr(
+        "hermes_cli.service_manager.detect_service_manager", lambda: "s6",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.service_manager.get_service_manager", lambda: rec,
+    )
+    assert gw._dispatch_all_via_service_manager_if_s6("start") is True
+    assert rec.calls == ["start:gateway-default", "start:gateway-bot_news"]
+    assert "Started 2 profile gateway(s)" in capsys.readouterr().out
+
+
 def test_dispatch_all_unknown_action_returns_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`start --all` is not a supported CLI surface; the helper must
-    fall through to the host code path rather than no-op."""
+    """Unsupported --all actions fall through to the host code path."""
     from hermes_cli import gateway as gw
     monkeypatch.setattr(
         "hermes_cli.service_manager.detect_service_manager", lambda: "s6",
@@ -257,7 +293,7 @@ def test_dispatch_all_unknown_action_returns_false(
             "manager should not be constructed for unsupported --all action",
         ),
     )
-    assert gw._dispatch_all_via_service_manager_if_s6("start") is False
+    assert gw._dispatch_all_via_service_manager_if_s6("reload") is False
 
 
 # ---------------------------------------------------------------------------
